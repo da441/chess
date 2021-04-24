@@ -36,6 +36,14 @@ enum PieceColour {
   WHITE,
 };
 
+enum Variant {
+  VARIANT_NONE,
+  VARIANT_ATOMIC,
+  VARIANT_HILL,
+};
+
+static Variant variant = VARIANT_NONE;
+
 class Square {
 public:
   Piece occupancy;
@@ -234,9 +242,37 @@ BoardState::BoardState(BoardState& previous_state, Move& move)
     }
   }
 
-  num_pieces_remaining -= (board[move.to.y][move.to.x].occupancy != NONE);
-  board[move.to.y][move.to.x] = board[move.from.y][move.from.x];
-  board[move.from.y][move.from.x].occupancy = NONE;
+  switch (variant) {
+  case VARIANT_ATOMIC:
+    if (board[move.to.y][move.to.x].occupancy != NONE) {
+      for (int dx = -1; dx <= 1; dx++) {
+        for (int dy = -1; dy <= 1; dy++) {
+          if (!within_bounds(move.to.x + dx, move.to.y + dy))
+            continue;
+          switch (board[move.to.y + dy][move.to.x + dx].occupancy) {
+          case NONE:
+            break;
+          case PAWN:
+            if (dx || dy)
+              break;
+          default:
+            board[move.to.y + dy][move.to.x + dx].occupancy = NONE;
+            num_pieces_remaining--;
+            break;
+          }
+        }
+      }
+    } else {
+      board[move.to.y][move.to.x] = board[move.from.y][move.from.x];
+    }
+    board[move.from.y][move.from.x].occupancy = NONE;
+    break;
+  default:
+    num_pieces_remaining -= (board[move.to.y][move.to.x].occupancy != NONE);
+    board[move.to.y][move.to.x] = board[move.from.y][move.from.x];
+    board[move.from.y][move.from.x].occupancy = NONE;
+    break;
+  }
 
   // Queen a pawn that made its way to the end
   if (board[move.to.y][move.to.x].occupancy == PAWN && move.to.y % 7 == 0)
@@ -437,9 +473,16 @@ void BoardState::enumerate_all_moves(void) {
   bool king_present = false;
   for (int y = 0; y < 8; y++) {
     for (int x = 0; x < 8; x++) {
-      if (board[y][x].occupancy == NONE ||
-          (whites_turn == (board[y][x].colour == BLACK)))
+      if (board[y][x].occupancy == NONE)
         continue;
+      if (whites_turn == (board[y][x].colour == BLACK)) {
+        if (variant == VARIANT_HILL && board[y][x].occupancy == KING &&
+            x >= 3 && x <= 4 && y >= 3 && y <= 4) {
+          possible_moves.clear();
+          return;
+        }
+        continue;
+      }
       switch (board[y][x].occupancy) {
         case PAWN:
           add_pawn_moves(x, y);
@@ -515,6 +558,10 @@ int BoardState::Evaluate(bool eval_for_white)
             ? INT_MIN : INT_MAX;
         }
         score[board[y][x].colour] += 1000000;
+        if (variant == VARIANT_HILL && x >= 3 && x <= 4 && y >= 3 && y <= 4) {
+          return (eval_for_white == (board[y][x].colour == WHITE))
+            ? INT_MAX : INT_MIN;
+        }
         break;
       default:
         break;
@@ -528,12 +575,12 @@ int BoardState::Evaluate(bool eval_for_white)
   }
   if (material[BLACK] > material[WHITE]) {
     // Black should want to trade down, so let's make their material worth less
-    score[BLACK] += material[BLACK] * 0.99;
+    score[BLACK] += lround(material[BLACK] * 0.99);
     score[WHITE] += material[WHITE];
   } else if (material[BLACK] < material[WHITE]) {
     // Vice versa
     score[BLACK] += material[BLACK];
-    score[WHITE] += material[WHITE] * 0.99;
+    score[WHITE] += lround(material[WHITE] * 0.99);
   }
   return (eval_for_white ? 1 : -1) * (score[WHITE] - score[BLACK]);
 }
@@ -624,7 +671,7 @@ static Move* find_best_move(BoardState& state)
   const int num_moves = state.possible_moves.size();
   Move *best_move = &state.possible_moves.get(0);
   int best_score = INT_MIN;
-  int search_depth = 4;
+  int search_depth = 1;
   Timer timer;
   while (timer.elapsed() < 4.0) {
     Move *best_move_this_iter = best_move;
@@ -662,7 +709,7 @@ static Move* find_best_move(BoardState& state)
     }
     best_move = best_move_this_iter;
     best_score = best_score_this_iter;
-    if (best_score > 9000)
+    if (best_score > 9000 || best_score < -9000)
       break;
     search_depth++;
   }
@@ -670,7 +717,7 @@ static Move* find_best_move(BoardState& state)
     timer.elapsed() << " seconds\n";
   cout << "Best move has score " << best_score << "\n";
 
-  if (best_score <= -1000) {
+  if (variant == VARIANT_NONE && best_score <= -1000) {
     cout << "Resigns\n";
     return nullptr;
   }
@@ -722,7 +769,8 @@ static bool parse_move_string(BoardState& state, string str, Move &move)
       move.to.y = str[3] - '1';
       for (int i = 0; i < state.possible_moves.size(); i++) {
         Move found_move = state.possible_moves.get(i);
-        if (found_move.to == move.to && found_move.from.x == str[0] - 'a') {
+        if (found_move.to == move.to && found_move.from.x == str[0] - 'a' &&
+            state.board[found_move.from.y][found_move.from.x].occupancy == PAWN) {
           move.from = found_move.from;
           return true;
         }
@@ -770,54 +818,89 @@ static bool parse_move_string(BoardState& state, string str, Move &move)
 
 int main()
 {
-  vector<BoardState> game;
-  game.emplace_back();
-  int move_num = 0;
-
-  print_board(game[move_num]);
-
-  while (game[move_num].possible_moves.size()) {
+  while (true) {
     string user_input;
-  get_user_input:
-    cout << "Please enter your move\n";
+    int num_players = 1;
+    bool engine_plays_black = true;
+    cout << "How many players? (0, 1, 2)\n";
     cin >> user_input;
-    while (user_input == "Undo" || user_input == "undo") {
-      game.pop_back();
-      game.pop_back();
-      move_num -= 2;
-      cout << "\n";
-      print_board(game[move_num]);
-      cout << "Please enter your move\n";
+    if (user_input == "0" || user_input == "2")
+      num_players = atoi(user_input.c_str());
+
+    if (num_players == 1) {
+      cout << "Computer colour? (white, black)\n";
       cin >> user_input;
+      if (user_input == "White" || user_input == "white")
+        engine_plays_black = false;
     }
-    Move user_move;
-    if (user_input == "Hint" || user_input == "hint") {
-      Move* best_move = find_best_move(game[move_num]);
-      if (!best_move)
-        break;
-      game.emplace_back(
-        game[move_num++],
-        *best_move
-      );
-      print_board(game[move_num]);
-    } else if (parse_move_string(game[move_num], user_input, user_move)) {
-      game.emplace_back(
-        game[move_num++],
-        user_move
-      );
-      cout << "\n";
-      print_board(game[move_num]);
-    } else {
-      cout << "Failed to find a legal move matching that instruction\n";
-      goto get_user_input;
-    }
-    Move* best_move = find_best_move(game[move_num]);
-    if (!best_move)
-      break;
-    game.emplace_back(
-      game[move_num++],
-      *best_move
-    );
+
+    cout << "Variant? (atomic, hill)\n";
+    cin >> user_input;
+    if (user_input == "Atomic" || user_input == "atomic")
+      variant = VARIANT_ATOMIC;
+    if (user_input == "Hill" || user_input == "hill")
+      variant = VARIANT_HILL;
+
+    vector<BoardState> game;
+    game.emplace_back();
+    int move_num = 0;
+
     print_board(game[move_num]);
+
+    while (game[move_num].possible_moves.size()) {
+      if (num_players > 0 &&
+        !(move_num == 0 && num_players == 1 && !engine_plays_black)) {
+        cout << "Please enter your move\n";
+        cin >> user_input;
+        while (user_input == "Undo" || user_input == "undo") {
+          game.pop_back();
+          game.pop_back();
+          move_num -= 2;
+          cout << "\n";
+          print_board(game[move_num]);
+          cout << "Please enter your move\n";
+          cin >> user_input;
+        }
+        Move user_move;
+        if (user_input == "Resign" || user_input == "resign" ||
+          user_input == "Retry" || user_input == "retry" ||
+          user_input == "Restart" || user_input == "restart") {
+          break;
+        } else if (user_input == "Exit" || user_input == "exit" ||
+            user_input == "Quit" || user_input == "quit") {
+          return 0;
+        } else if (user_input == "Hint" || user_input == "hint") {
+          Move* best_move = find_best_move(game[move_num]);
+          if (!best_move)
+            break;
+          game.emplace_back(
+            game[move_num++],
+            *best_move
+          );
+          print_board(game[move_num]);
+        } else if (parse_move_string(game[move_num], user_input, user_move)) {
+          game.emplace_back(
+            game[move_num++],
+            user_move
+          );
+          cout << "\n";
+          print_board(game[move_num]);
+        } else {
+          cout << "Failed to find a legal move matching that instruction\n";
+          continue;
+        }
+      }
+
+      if (num_players < 2) {
+        Move* best_move = find_best_move(game[move_num]);
+        if (!best_move)
+          break;
+        game.emplace_back(
+          game[move_num++],
+          *best_move
+        );
+        print_board(game[move_num]);
+      }
+    }
   }
 }
