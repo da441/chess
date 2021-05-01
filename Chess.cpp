@@ -1,159 +1,20 @@
 #include <iostream>
-#include <vector>
 #include <thread>
-#include <chrono>
 #include <cassert>
 
-using namespace std;
-
-class Timer {
-public:
-  Timer() : beg_(clock_::now()) {}
-  void reset() { beg_ = clock_::now(); }
-  double elapsed() const {
-    return chrono::duration_cast<second_>
-      (clock_::now() - beg_).count();
-  }
-
-private:
-  typedef chrono::high_resolution_clock clock_;
-  typedef chrono::duration<double, ratio<1> > second_;
-  chrono::time_point<clock_> beg_;
-};
-
-enum Piece {
-  NONE,
-  PAWN,
-  KNIGHT,
-  BISHOP,
-  ROOK,
-  QUEEN,
-  KING,
-};
-
-enum PieceColour {
-  BLACK,
-  WHITE,
-};
-
-enum Variant {
-  VARIANT_NONE,
-  VARIANT_ATOMIC,
-  VARIANT_HILL,
-};
+#include "Chess.h"
+#include "PieceSquareTables.h"
+#include "TranspositionTable.h"
+#include "Utils.h"
 
 static Variant variant = VARIANT_NONE;
-
-class Square {
-public:
-  Piece occupancy;
-  PieceColour colour;
-};
-
-class Coords {
-public:
-  Coords(int x_coord = 0, int y_coord = 0) {
-    x = x_coord;
-    y = y_coord;
-  }
-  bool operator==(const Coords& rhs) const {
-    return rhs.x == x && rhs.y == y;
-  }
-
-  int x;
-  int y;
-};
-
-class Move {
-public:
-  Move(void) {
-    from = 0;
-    to = 0;
-  }
-  Move(Coords& move_from, Coords& move_to) {
-    from = move_from;
-    to = move_to;
-  }
-  Move(Coords move_from, Coords move_to, int disambiguation) {
-    from = move_from;
-    to = move_to;
-  }
-  bool operator==(const Move& rhs) const {
-    return rhs.from == from && rhs.to == to;
-  }
-
-  Coords from;
-  Coords to;
-};
-
-// Vector is O(n) to insert at the front, so let's reserve insertion space
-class MoveVector {
-public:
-  MoveVector(void) {
-    v = vector<Move>(15);
-    v.reserve(50);
-    m_front = 15;
-    m_size = 0;
-  }
-  void emplace_back(Coords& from, Coords& to) {
-    v.emplace_back(from, to);
-    m_size++;
-  }
-  void emplace_front(Coords& from, Coords& to) {
-    if (m_front > 0) {
-      m_front--;
-      v[m_front] = Move(from, to);
-    } else {
-      v.emplace(v.begin(), from, to);
-    }
-    m_size++;
-  }
-  Move& get(int i) {
-    return v[m_front + i];
-  }
-  int size(void) {
-    return m_size;
-  }
-  void clear(void) {
-    m_size = 0;
-  }
-private:
-  vector<Move> v;
-  int m_front;
-  int m_size;
-};
+static TranspositionTable* ttable;
+static int positions_checked;
 
 static bool within_bounds(int x, int y)
 {
   return x >= 0 && x < 8 && y >= 0 && y < 8;
 }
-
-class BoardState {
-public:
-  BoardState(void);
-  BoardState(BoardState& previous_state, Move& move);
-  int Evaluate(bool eval_for_white);
-
-  Square board[8][8];
-  bool whites_turn;
-  MoveVector possible_moves;
-
-private:
-  bool can_move_to_space(int x, int y);
-  bool king_in_check(int x, int y);
-  void add_move(Coords& from, Coords& to);
-  void add_pawn_moves(int x, int y);
-  void add_knight_moves(int x, int y);
-  void add_bishop_moves(int x, int y);
-  void add_rook_moves(int x, int y);
-  void add_king_moves(int x, int y);
-  void enumerate_all_moves(void);
-
-  Coords en_passant_available;
-  bool can_castle_q_side[2];
-  bool can_castle_k_side[2];
-  int num_pieces_remaining;
-};
 
 static const Piece back_rank[] = {
   ROOK,
@@ -169,118 +30,193 @@ static const Piece back_rank[] = {
 BoardState::BoardState(void)
   : whites_turn(true)
   , en_passant_available(0, 0)
-  , can_castle_q_side{ true, true }
-  , can_castle_k_side{ true, true }
-  , num_pieces_remaining(32)
+  , castling_rights{ true, true, true, true }
+  , material{ 0 }
+  , previous_state(nullptr)
+  , previous_move(nullptr)
+  , zobrist_hash(0)
+  , endgame_reached(false)
+  , eval(0)
 {
-  memset(board, 0, sizeof(board));
+  for (int y = 2; y < 6; y ++) {
+    for (int x = 0; x < 8; x++) {
+      board[y][x].occupancy = NONE;
+    }
+  }
   for (int x = 0; x < 8; x++) {
-    board[1][x].occupancy = PAWN;
-    board[1][x].colour = WHITE;
-    board[6][x].occupancy = PAWN;
-    board[6][x].colour = BLACK;
+    add_piece(x, 1, PAWN, WHITE);
+    add_piece(x, 6, PAWN, BLACK);
   }
   PieceColour c = WHITE;
   for (int y = 0; y <= 7; y += 7) {
     for (int x = 0; x < 8; x++) {
-      board[y][x].occupancy = back_rank[x];
-      board[y][x].colour = c;
+      add_piece(x, y, back_rank[x], c);
     }
     c = BLACK;
   }
 
+  psts[PAWN] = pawn_pst;
+  psts[KNIGHT] = knight_pst;
+  psts[BISHOP] = bishop_pst;
+  psts[ROOK] = rook_pst;
+  psts[QUEEN] = queen_pst;
+  psts[KING] = king_mg_pst;
+
   enumerate_all_moves();
 }
 
-BoardState::BoardState(BoardState& previous_state, Move& move)
-  : can_castle_q_side{ previous_state.can_castle_q_side[0],
-                       previous_state.can_castle_q_side[1] }
-  , can_castle_k_side{ previous_state.can_castle_k_side[0],
-                       previous_state.can_castle_k_side[1] }
+BoardState::BoardState(const BoardState *prev_state, const Move *move, bool enum_moves)
+  : zobrist_hash(prev_state->zobrist_hash)
   , en_passant_available{ -1, -1 }
-  , num_pieces_remaining(previous_state.num_pieces_remaining)
+  , endgame_reached(prev_state->endgame_reached)
+  , eval(0)
+  , evaluated(false)
 {
-  memcpy(board, previous_state.board, sizeof(board));
+  memcpy(board, prev_state->board, sizeof(board));
+  memcpy(castling_rights, prev_state->castling_rights, sizeof(castling_rights));
+  memcpy(psts, prev_state->psts, sizeof(psts));
+  memcpy(material, prev_state->material, sizeof(material));
 
-  if (board[move.from.y][move.from.x].occupancy == PAWN) {
-    int pawn_displacement = move.to.y - move.from.y;
+  bool piece_captured = false;
+
+  if (prev_state->en_passant_available.x >= 0) {
+    ttable->zobrist_xor_en_passant(
+      zobrist_hash, prev_state->en_passant_available.x);
+  }
+
+  if (board[move->from.y][move->from.x].occupancy == PAWN) {
+    int pawn_displacement = move->to.y - move->from.y;
     if (pawn_displacement > 1 || pawn_displacement < -1) {
       // Mark a double-moving pawn as able to be captured en passant
       en_passant_available =
-        Coords(move.from.x, move.from.y + pawn_displacement / 2);
-    } else if (move.from.x != move.to.x &&
-      board[move.to.y][move.to.x].occupancy == NONE) {
+        Coords(move->from.x, move->from.y + pawn_displacement / 2);
+      ttable->zobrist_xor_en_passant(zobrist_hash, move->from.x);
+    } else if (move->from.x != move->to.x &&
+      board[move->to.y][move->to.x].occupancy == NONE) {
       // If a pawn moved diagonally to an unoccupied square, it's en passant
-      board[move.to.y - pawn_displacement][move.to.x].occupancy = NONE;
+      remove_piece(move->to.x, move->to.y - pawn_displacement);
+      piece_captured = true;
     }
   }
 
   // Castling
-  if (board[move.from.y][move.from.x].occupancy == KING) {
-    int king_displacement = move.to.x - move.from.x;
+  if (board[move->from.y][move->from.x].occupancy == KING) {
+    int king_displacement = move->to.x - move->from.x;
     if (king_displacement > 1 || king_displacement < -1) {
       int king_move_direction = king_displacement / 2;
-      int rook_old_x = move.to.x;
+      int rook_old_x = move->to.x;
       while (rook_old_x % 7 != 0)
         rook_old_x += king_move_direction;
-      board[move.from.y][move.from.x + king_move_direction] =
-        board[move.from.y][rook_old_x];
-      board[move.from.y][rook_old_x].occupancy = NONE;
+      add_piece(move->from.x + king_move_direction, move->from.y,
+        board[move->from.y][rook_old_x]);
+      remove_piece(rook_old_x, move->from.y);
     }
   }
 
   // If a king or rook moves, it can no longer castle
-  bool w = previous_state.whites_turn;
-  if (can_castle_q_side[w] || can_castle_k_side[w]) {
-    if (move.from == Coords(4, !w * 7)) {
-      can_castle_q_side[w] = false;
-      can_castle_k_side[w] = false;
-    } else if (move.from == Coords(0, !w * 7)) {
-      can_castle_q_side[w] = false;
-    } else if (move.from == Coords(7, !w * 7)) {
-      can_castle_k_side[w] = false;
+  for (int i = 0; i < 4; i++) {
+    int back_rank = i < 2 ? 0 : 7;
+    int rook_x = i % 2 ? 0 : 7;
+    if (castling_rights[i] &&
+        (move->from == Coords(4,      back_rank) ||
+         move->from == Coords(rook_x, back_rank) ||
+         move->to   == Coords(rook_x, back_rank))) {
+      castling_rights[i] = false;
+      ttable->zobrist_xor_castling_rights(
+        zobrist_hash, static_cast<CastlingRight>(i));
     }
   }
 
   switch (variant) {
   case VARIANT_ATOMIC:
-    if (board[move.to.y][move.to.x].occupancy != NONE) {
+    if (board[move->to.y][move->to.x].occupancy != NONE) {
       for (int dx = -1; dx <= 1; dx++) {
         for (int dy = -1; dy <= 1; dy++) {
-          if (!within_bounds(move.to.x + dx, move.to.y + dy))
+          if (!within_bounds(move->to.x + dx, move->to.y + dy))
             continue;
-          switch (board[move.to.y + dy][move.to.x + dx].occupancy) {
+          switch (board[move->to.y + dy][move->to.x + dx].occupancy) {
           case NONE:
             break;
           case PAWN:
             if (dx || dy)
               break;
           default:
-            board[move.to.y + dy][move.to.x + dx].occupancy = NONE;
-            num_pieces_remaining--;
+            remove_piece(move->to.x + dx, move->to.y + dy);
+            piece_captured = true;
             break;
           }
         }
       }
     } else {
-      board[move.to.y][move.to.x] = board[move.from.y][move.from.x];
+      add_piece(move->to.x, move->to.y, board[move->from.y][move->from.x]);
     }
-    board[move.from.y][move.from.x].occupancy = NONE;
+    // Only remove piece if we haven't already done so above
+    if (board[move->from.y][move->from.x].occupancy != NONE) {
+      remove_piece(move->from.x, move->from.y);
+      piece_captured = true;
+    }
     break;
   default:
-    num_pieces_remaining -= (board[move.to.y][move.to.x].occupancy != NONE);
-    board[move.to.y][move.to.x] = board[move.from.y][move.from.x];
-    board[move.from.y][move.from.x].occupancy = NONE;
+    if (board[move->to.y][move->to.x].occupancy != NONE) {
+      material[board[move->to.y][move->to.x].colour][board[move->to.y][move->to.x].occupancy]--;
+      piece_captured = true;
+      (material[WHITE][QUEEN] == 0 || material[WHITE][KNIGHT] + material[WHITE][BISHOP] + material[WHITE][ROOK] < 2);
+      // remove taken piece from hash
+      ttable->zobrist_xor_piece(zobrist_hash, static_cast<PieceType>(
+          !board[move->to.y][move->to.x].colour * 6 +
+          board[move->to.y][move->to.x].occupancy
+        ), move->to.x, move->to.y);
+    }
+    add_piece(move->to.x, move->to.y, board[move->from.y][move->from.x]);
+    remove_piece(move->from.x, move->from.y);
     break;
   }
 
   // Queen a pawn that made its way to the end
-  if (board[move.to.y][move.to.x].occupancy == PAWN && move.to.y % 7 == 0)
-    board[move.to.y][move.to.x].occupancy = QUEEN;
+  if (board[move->to.y][move->to.x].occupancy == PAWN && move->to.y % 7 == 0) {
+    remove_piece(move->to.x, move->to.y);
+    add_piece(move->to.x, move->to.y, QUEEN, board[move->to.y][move->to.x].colour);
+  }
 
-  whites_turn = !previous_state.whites_turn;
+  whites_turn = !prev_state->whites_turn;
+  ttable->zobrist_xor_player(zobrist_hash);
 
-  enumerate_all_moves();
+  if (enum_moves)
+    enumerate_all_moves();
+  moves_enumerated = enum_moves;
+
+  if (!endgame_reached && piece_captured) {
+    // See if we've now reached the endgame
+    int players_in_endgame = 0;
+    for (int i = 0; i < 2; i++) {
+      if (material[i][QUEEN] == 0 ||
+          material[i][KNIGHT] + material[i][BISHOP] + material[i][ROOK] < 2)
+        players_in_endgame++;
+    }
+    if (players_in_endgame == 2) {
+      endgame_reached = true;
+      psts[KING] = king_eg_pst;
+    }
+  }
+
+  previous_state = prev_state;
+  previous_move = move;
+  positions_checked++;
+
+  // Check for draw by repetition
+  int repetitions = 1;
+  const BoardState *iter = previous_state;
+  while (iter != nullptr) {
+    if (iter->zobrist_hash == zobrist_hash)
+      repetitions++;
+    iter = iter->previous_state;
+  }
+  if (repetitions >= 3) {// Draw
+    possible_moves.clear();
+    moves_enumerated = true;
+    eval = 0;
+    evaluated = true;
+  }
 }
 
 bool BoardState::can_move_to_space(int x, int y) {
@@ -346,10 +282,7 @@ bool BoardState::king_in_check(int x, int y) {
 
 void BoardState::add_move(Coords& from, Coords& to)
 {
-  if (board[to.y][to.x].occupancy == NONE)
-    possible_moves.emplace_back(from, to);
-  else
-    possible_moves.emplace_front(from, to);
+  possible_moves.emplace_back(from, to);
 }
 
 void BoardState::add_pawn_moves(int x, int y) {
@@ -448,7 +381,7 @@ void BoardState::add_king_moves(int x, int y) {
     }
   }
   int back_rank = !whites_turn * 7;
-  if (can_castle_q_side[whites_turn] &&
+  if (castling_rights[whites_turn ? WHITE_QUEENSIDE : BLACK_QUEENSIDE] &&
       board[back_rank][1].occupancy == NONE &&
       board[back_rank][2].occupancy == NONE &&
       board[back_rank][3].occupancy == NONE &&
@@ -458,7 +391,7 @@ void BoardState::add_king_moves(int x, int y) {
     Coords to(2, back_rank);
     add_move(from, to);
   }
-  if (can_castle_k_side[whites_turn] &&
+  if (castling_rights[whites_turn ? WHITE_KINGSIDE : BLACK_KINGSIDE] &&
       board[back_rank][5].occupancy == NONE &&
       board[back_rank][6].occupancy == NONE &&
       !king_in_check(4, back_rank) &&
@@ -469,7 +402,8 @@ void BoardState::add_king_moves(int x, int y) {
   }
 }
 
-void BoardState::enumerate_all_moves(void) {
+void BoardState::enumerate_all_moves() {
+  possible_moves.reserve(50);
   bool king_present = false;
   for (int y = 0; y < 8; y++) {
     for (int x = 0; x < 8; x++) {
@@ -514,208 +448,195 @@ void BoardState::enumerate_all_moves(void) {
     possible_moves.clear();
 }
 
-int BoardState::Evaluate(bool eval_for_white)
+void BoardState::add_piece(int x, int y, Square& sq)
 {
+  board[y][x] = sq;
+  ttable->zobrist_xor_piece(zobrist_hash,
+    static_cast<PieceType>(!sq.colour * 6 + sq.occupancy), x, y);
+  material[sq.colour][sq.occupancy]++;
+}
+
+void BoardState::add_piece(int x, int y, Piece piece, PieceColour colour)
+{
+  board[y][x].occupancy = piece;
+  board[y][x].colour = colour;
+  ttable->zobrist_xor_piece(zobrist_hash,
+    static_cast<PieceType>(!colour * 6 + piece - 1), x, y);
+  material[colour][piece]++;
+}
+
+void BoardState::remove_piece(int x, int y)
+{
+  ttable->zobrist_xor_piece(zobrist_hash, static_cast<PieceType>(
+      !board[y][x].colour * 6 + board[y][x].occupancy
+    ), x, y);
+  material[board[y][x].colour][board[y][x].occupancy]--;
+  board[y][x].occupancy = NONE;
+}
+
+int BoardState::evaluate()
+{
+  static const int piece_values[] = { 100, 300, 300, 500, 900, 20000 };
   int score[2] = { 0 };
-  int material[2] = { 0 };
-  int bishops[2] = { 0 };
-  int pawn_development_bonus = 100 / num_pieces_remaining;
   for (int y = 0; y < 8; y++) {
     for (int x = 0; x < 8; x++) {
-      switch (board[y][x].occupancy) {
-      case PAWN:
-        material[board[y][x].colour] += 100;
-        score[board[y][x].colour] +=
-          (board[y][x].colour ? y - 1 : 6 - y) * pawn_development_bonus;
-        break;
-      case KNIGHT:
-        material[board[y][x].colour] += 300;
-        if (!board[y][x].colour * 7 == y)
-          // minor piece on back rank
-          score[board[y][x].colour] -= 25;
-        break;
-      case BISHOP:
-        material[board[y][x].colour] += 300;
-        if (!board[y][x].colour * 7 == y)
-          // minor piece on back rank
-          score[board[y][x].colour] -= 25;
-        bishops[board[y][x].colour]++;
-        break;
-      case ROOK:
-        material[board[y][x].colour] += 500;
-        break;
-      case QUEEN:
-        material[board[y][x].colour] += 900;
-        break;
-      case KING:
-        if (possible_moves.size() == 0 &&
-            (board[y][x].colour == WHITE) == whites_turn) {
+      if (board[y][x].occupancy == NONE)
+        continue;
+
+      score[board[y][x].colour] += piece_values[board[y][x].occupancy];
+      score[board[y][x].colour] +=
+        psts[board[y][x].occupancy][(board[y][x].colour == WHITE ? 7 - y : y) * 8 + x];
+
+      if (board[y][x].occupancy == KING) {
+        if (moves_enumerated && possible_moves.size() == 0 &&
+          (board[y][x].colour == WHITE) == whites_turn) {
           if (!king_in_check(x, y))
             // stalemate
             return 0;
           // checkmate
-          return (eval_for_white == (board[y][x].colour == WHITE))
-            ? INT_MIN : INT_MAX;
+          return board[y][x].colour == WHITE ? INT16_MIN : INT16_MAX;
         }
-        score[board[y][x].colour] += 1000000;
         if (variant == VARIANT_HILL && x >= 3 && x <= 4 && y >= 3 && y <= 4) {
-          return (eval_for_white == (board[y][x].colour == WHITE))
-            ? INT_MAX : INT_MIN;
+          return board[y][x].colour == WHITE ? INT16_MAX : INT16_MIN;
         }
-        break;
-      default:
-        break;
+        if (!endgame_reached) {// King safety
+          const int forwards = board[y][x].colour * 2 - 1;
+          int i = 1;
+          while (i <= 2 && within_bounds(x, y + forwards * i)) {
+            if (board[y + forwards * i][x].occupancy == PAWN &&
+              board[y + forwards * i][x].colour == board[y][x].colour) {
+              score[board[y][x].colour] += 50;
+              break;
+            }
+            i++;
+          }
+        }
       }
     }
   }
   for (int i = 0; i < 2; i++) {
-    if (bishops[i] == 2)
+    if (material[i][BISHOP] == 2)
       // has a bishop pair
       score[i] += 20;
   }
-  if (material[BLACK] > material[WHITE]) {
-    // Black should want to trade down, so let's make their material worth less
-    score[BLACK] += lround(material[BLACK] * 0.99);
-    score[WHITE] += material[WHITE];
-  } else if (material[BLACK] < material[WHITE]) {
-    // Vice versa
-    score[BLACK] += material[BLACK];
-    score[WHITE] += lround(material[WHITE] * 0.99);
+  return score[WHITE] - score[BLACK];
+}
+
+int BoardState::Evaluate()
+{
+  if (!evaluated) {
+    eval = evaluate();
+    evaluated = true;
   }
-  return (eval_for_white ? 1 : -1) * (score[WHITE] - score[BLACK]);
+  return eval;
 }
 
-static void print_board(BoardState &state)
+void BoardState::UpdateEval(int score)
 {
-  for (int i = 7; i >= 0; i--) {
-    for (int j = 0; j < 8; j++) {
-      cout << "\033[";
-      if (state.board[i][j].occupancy != NULL &&
-          state.board[i][j].colour == BLACK) {
-        cout << ";34";
-      }
-      cout << "m";
-      switch (state.board[i][j].occupancy) {
-      case PAWN:
-        cout << "P";
-        break;
-      case KNIGHT:
-        cout << "N";
-        break;
-      case BISHOP:
-        cout << "B";
-        break;
-      case ROOK:
-        cout << "R";
-        break;
-      case QUEEN:
-        cout << "Q";
-        break;
-      case KING:
-        cout << "K";
-        break;
-      default:
-        cout << "_";
-        break;
-      }
-      cout << "\033[m";
-      cout << " ";
-    }
-    cout << "\n";
-  }
-  cout << (state.whites_turn ? "White" : "Black") << " to move.\n";
-  int score = state.Evaluate(true);
-  cout << "White's current score: " << score << "\n";
-  cout << "\n";
+  eval = score;
 }
 
-static int minimax(BoardState& state, int depth, int alpha, int beta,
-  bool max_player, bool play_as_white)
+static bool sort_fn(BoardState& a, BoardState& b)
 {
-  const int num_moves = state.possible_moves.size();
-  if (depth == 0 || num_moves == 0)
-    return state.Evaluate(play_as_white);
-  if (max_player) {
-    int value = INT_MIN;
-    for (int i = 0; i < num_moves; i++) {
-      BoardState child(state, state.possible_moves.get(i));
-      value = max(value, minimax(child, depth - 1, alpha, beta, false, play_as_white));
-      alpha = max(value, alpha);
-      if (alpha >= beta)
-        break;
-    }
-    return value;
-  } else {
-    int value = INT_MAX;
-    for (int i = 0; i < num_moves; i++) {
-      BoardState child(state, state.possible_moves.get(i));
-      value = min(value, minimax(child, depth - 1, alpha, beta, true, play_as_white));
-      beta  = min(value, beta);
-      if (beta <= alpha)
-        break;
-    }
-    return value;
-  }
+  return a.whites_turn
+    ? a.Evaluate() < b.Evaluate()
+    : a.Evaluate() > b.Evaluate();
 }
 
-static void minimax_thread(BoardState& state, int move_num, int depth,
-  volatile int *ret, volatile bool *completed)
+static int negamax(BoardState& state, int depth, int alpha, int beta, int colour)
 {
-  BoardState trial_state(state, state.possible_moves.get(move_num));
-  *ret = minimax(trial_state, depth, INT_MIN, INT_MAX, false, state.whites_turn);
-  *completed = true;
-}
+  int original_alpha = alpha;
 
-static Move* find_best_move(BoardState& state)
-{
-  const int num_moves = state.possible_moves.size();
-  Move *best_move = &state.possible_moves.get(0);
-  int best_score = INT_MIN;
-  int search_depth = 1;
-  Timer timer;
-  while (timer.elapsed() < 4.0) {
-    Move *best_move_this_iter = best_move;
-    int best_score_this_iter = INT_MIN;
-    volatile int *move_scores = new volatile int[num_moves];
-    volatile bool *work_completed = new bool[num_moves];
-    for (int i = 0; i < num_moves; i++)
-      work_completed[i] = false;
-    vector<thread> threads;
-    for (int move_num = 0; move_num < num_moves; move_num++) {
-      threads.emplace_back(
-        minimax_thread, ref(state), move_num, search_depth,
-          &move_scores[move_num], &work_completed[move_num]
-      );
-    }
-  keep_waiting:
-    if (timer.elapsed() > 30.0) {
-      for (int i = 0; i < num_moves; i++) {
-        threads[i].detach();
-      }
+  TableEntry *entry;
+  if (ttable->search(state.zobrist_hash, depth, &entry)) {
+    switch (entry->flag) {
+    case FLAG_EXACT:
+      return entry->eval;
+    case FLAG_LOWER_BOUND:
+      alpha = max(alpha, entry->eval);
+      break;
+    case FLAG_UPPER_BOUND:
+      beta = min(beta, entry->eval);
       break;
     }
-    this_thread::sleep_for(chrono::milliseconds(100));
-    for (int i = 0; i < num_moves; i++) {
-      if (!work_completed[i])
-        goto keep_waiting;
-    }
+    if (alpha >= beta)
+      return entry->eval;
+  }
+  const int num_moves = state.possible_moves.size();
+  if (depth == 0 || num_moves == 0)
+    return state.Evaluate() * colour;
 
-    for (int i = 0; i < num_moves; i++) {
-      threads[i].join();
-      if (move_scores[i] > best_score_this_iter) {
-        best_score_this_iter = move_scores[i];
-        best_move_this_iter = &state.possible_moves.get(i);
+  vector<BoardState> trial_states;
+  trial_states.reserve(num_moves);
+  for (int move_num = 0; move_num < num_moves; move_num++) {
+    trial_states.emplace_back(&state, &state.possible_moves[move_num], depth > 1);
+  }
+
+  // Sorting again towards the end of the search gives little reordering,
+  // and stops being worth the cost of sorting
+  if (depth > 2)
+    sort(trial_states.begin(), trial_states.end(), sort_fn);
+
+  int value = INT_MIN;
+  for (int i = 0; i < num_moves; i++) {
+    value = max(value, -negamax(trial_states[i], depth - 1, -beta, -alpha, -colour));
+    alpha = max(value, alpha);
+    if (alpha >= beta)
+      break;
+  }
+
+  ttable->add(state.zobrist_hash, depth, value,
+    value <= original_alpha ? FLAG_UPPER_BOUND : value >= beta ? FLAG_LOWER_BOUND : FLAG_EXACT);
+  return value;
+}
+
+const Move* BoardState::find_best_move()
+{
+  const int num_moves = possible_moves.size();
+  const Move *best_move = &possible_moves[0];
+  int best_score = INT_MIN;
+  int search_depth = 0;
+  Timer timer;
+  positions_checked = 0;
+
+  vector<BoardState> trial_states;
+  trial_states.reserve(num_moves);
+  for (int move_num = 0; move_num < num_moves; move_num++) {
+    trial_states.emplace_back(this, &possible_moves[move_num]);
+  }
+
+  while (timer.elapsed() < 5.0) {
+    const Move *best_move_this_iter = best_move;
+    int best_score_this_iter = INT_MIN;
+    int alpha = INT16_MIN, beta = INT16_MAX;
+
+    sort(trial_states.begin(), trial_states.end(), sort_fn);
+
+    for (int move_num = 0; move_num < num_moves; move_num++) {
+      int score = -negamax(trial_states[move_num], search_depth, -beta, -alpha, whites_turn ? -1 : 1);
+      alpha = max(score, alpha);
+      trial_states[move_num].UpdateEval(whites_turn ? score : -score);
+      if (score > best_score_this_iter) {
+        best_score_this_iter = score;
+        best_move_this_iter = trial_states[move_num].previous_move;
       }
     }
     best_move = best_move_this_iter;
     best_score = best_score_this_iter;
+
     if (best_score > 9000 || best_score < -9000)
       break;
     search_depth++;
   }
+
   cout << "Evaluated to search depth " << search_depth << " in " <<
     timer.elapsed() << " seconds\n";
-  cout << "Best move has score " << best_score << "\n";
+  cout << "Checked " << positions_checked << " positions in total\n";
+  string str;
+  move_to_string(this, best_move, str);
+  cout << "Best move " << str << " has score " << best_score << "\n";
+
+  ttable->clear();
 
   if (variant == VARIANT_NONE && best_score <= -1000) {
     cout << "Resigns\n";
@@ -725,99 +646,9 @@ static Move* find_best_move(BoardState& state)
   return best_move;
 }
 
-static bool is_letter_coord(char c)
-{
-  return c >= 'a' && c <= 'h';
-}
-
-static bool is_number_coord(char c)
-{
-  return c >= '1' && c <= '8';
-}
-
-static bool parse_move_string(BoardState& state, string str, Move &move)
-{
-  Piece piece_to_move;
-  switch (str[0]) {
-  case 'N':
-    piece_to_move = KNIGHT;
-    break;
-  case 'B':
-    piece_to_move = BISHOP;
-    break;
-  case 'R':
-    piece_to_move = ROOK;
-    break;
-  case 'Q':
-    piece_to_move = QUEEN;
-    break;
-  case 'K':
-    piece_to_move = KING;
-    break;
-  default:
-    if (is_letter_coord(str[0]))
-      piece_to_move = PAWN;
-    else
-      return false;
-    break;
-  }
-  if (piece_to_move == PAWN) {
-    if (str[1] == 'x') {
-      if (!is_letter_coord(str[2]) || !is_number_coord(str[3]))
-        return false;
-      move.to.x = str[2] - 'a';
-      move.to.y = str[3] - '1';
-      for (int i = 0; i < state.possible_moves.size(); i++) {
-        Move found_move = state.possible_moves.get(i);
-        if (found_move.to == move.to && found_move.from.x == str[0] - 'a' &&
-            state.board[found_move.from.y][found_move.from.x].occupancy == PAWN) {
-          move.from = found_move.from;
-          return true;
-        }
-      }
-    } else if (is_number_coord(str[1]) && str[2] == '\0') {
-      move.to.x = str[0] - 'a';
-      move.to.y = str[1] - '1';
-      for (int i = 0; i < state.possible_moves.size(); i++) {
-        Move found_move = state.possible_moves.get(i);
-        if (found_move.to == move.to && found_move.from.x == move.to.x &&
-            state.board[found_move.from.y][found_move.from.x].occupancy == PAWN) {
-          move.from = found_move.from;
-          return true;
-        }
-      }
-    }
-    return false;
-  }
-  int next_char_idx = 1;
-  char disambiguation_char = 0;
-  if ((is_letter_coord(str[1]) || is_number_coord(str[1])) &&
-      (is_letter_coord(str[2]) || str[2] == 'x'))
-    disambiguation_char = str[next_char_idx++];
-  if (str[next_char_idx] == 'x')
-    next_char_idx++;
-  if (is_letter_coord(str[next_char_idx]) &&
-      is_number_coord(str[next_char_idx + 1])) {
-    move.to.x = str[next_char_idx] - 'a';
-    move.to.y = str[next_char_idx + 1] - '1';
-    for (int i = 0; i < state.possible_moves.size(); i++) {
-      Move found_move = state.possible_moves.get(i);
-      if (found_move.to == move.to && piece_to_move ==
-          state.board[found_move.from.y][found_move.from.x].occupancy) {
-        if (disambiguation_char && 
-            found_move.from.x != disambiguation_char - 'a' &&
-            found_move.from.y != disambiguation_char - '1')
-          continue;
-        move.from = found_move.from;
-        return true;
-      }
-    }
-  }
-  return false;
-}
-
 int main()
 {
+  ttable = new TranspositionTable();
   while (true) {
     string user_input;
     int num_players = 1;
@@ -841,27 +672,25 @@ int main()
     if (user_input == "Hill" || user_input == "hill")
       variant = VARIANT_HILL;
 
-    vector<BoardState> game;
+    list<BoardState> game;
     game.emplace_back();
-    int move_num = 0;
 
-    print_board(game[move_num]);
+    print_board(game.back());
 
-    while (game[move_num].possible_moves.size()) {
+    while (game.back().possible_moves.size()) {
       if (num_players > 0 &&
-        !(move_num == 0 && num_players == 1 && !engine_plays_black)) {
+        !(game.size() == 1 && num_players == 1 && !engine_plays_black)) {
         cout << "Please enter your move\n";
         cin >> user_input;
         while (user_input == "Undo" || user_input == "undo") {
           game.pop_back();
           game.pop_back();
-          move_num -= 2;
           cout << "\n";
-          print_board(game[move_num]);
+          print_board(game.back());
           cout << "Please enter your move\n";
           cin >> user_input;
         }
-        Move user_move;
+        const Move *user_move = nullptr;
         if (user_input == "Resign" || user_input == "resign" ||
           user_input == "Retry" || user_input == "retry" ||
           user_input == "Restart" || user_input == "restart") {
@@ -869,22 +698,23 @@ int main()
         } else if (user_input == "Exit" || user_input == "exit" ||
             user_input == "Quit" || user_input == "quit") {
           return 0;
+        } else if (user_input == "Moves" || user_input == "moves") {
+          for (unsigned i = 0; i < game.back().possible_moves.size(); i++) {
+            string str;
+            move_to_string(&game.back(), &game.back().possible_moves[i], str);
+            cout << str << (i < game.back().possible_moves.size() - 1 ? ", " : ".");
+          }
+          cout << "\n";
         } else if (user_input == "Hint" || user_input == "hint") {
-          Move* best_move = find_best_move(game[move_num]);
+          const Move* best_move = game.back().find_best_move();
           if (!best_move)
             break;
-          game.emplace_back(
-            game[move_num++],
-            *best_move
-          );
-          print_board(game[move_num]);
-        } else if (parse_move_string(game[move_num], user_input, user_move)) {
-          game.emplace_back(
-            game[move_num++],
-            user_move
-          );
+          game.emplace_back(&game.back(), best_move);
+          print_board(game.back());
+        } else if (parse_move_string(game.back(), user_input, user_move)) {
+          game.emplace_back(&game.back(), user_move);
           cout << "\n";
-          print_board(game[move_num]);
+          print_board(game.back());
         } else {
           cout << "Failed to find a legal move matching that instruction\n";
           continue;
@@ -892,14 +722,11 @@ int main()
       }
 
       if (num_players < 2) {
-        Move* best_move = find_best_move(game[move_num]);
+        const Move* best_move = game.back().find_best_move();
         if (!best_move)
           break;
-        game.emplace_back(
-          game[move_num++],
-          *best_move
-        );
-        print_board(game[move_num]);
+        game.emplace_back(&game.back(), best_move);
+        print_board(game.back());
       }
     }
   }
